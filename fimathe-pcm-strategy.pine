@@ -1,0 +1,304 @@
+//@version=6
+// =============================================================================
+//  FIMATHE CYCLE + PCM — objective proxy of the discretionary Fimathe method
+//  (Teoria dos Ciclos / Marcelo Ferreira) with a PCM (Price Cycle Management)
+//  overlay for objective, non-discretionary TP/SL.
+//
+//  Concept mapping (Fimathe/PCM  ->  implementation):
+//   - Canal de Referência  -> rolling highest/lowest channel (non-repainting)
+//   - Zona Neutra          -> %-of-width band centered on the channel midline
+//   - Teoria dos Ciclos    -> var-bool arming flags: touch of an extreme arms
+//                             the cycle; close re-crossing the NEAR neutral
+//                             boundary fires the signal (once per cycle)
+//   - PCM                  -> SL = canal extreme +/- ATR buffer, TP = opposite
+//                             canal bound; both frozen at the signal bar
+//
+//  Assumptions (check against a real Fimathe chart reading):
+//   - Channel method ...... rolling highest(channelLen)/lowest(channelLen),
+//                           INCLUDES the current bar (see flagged note below)
+//   - Neutral zone % ...... symmetric band around the arithmetic midline;
+//                           presets: 35/45/55/60/65% (1/3/5/15/30 min)
+//   - Extreme tolerance % . wick within tol% of the canal extreme counts as a
+//                           touch; presets: 8/12/16/18/20% (1/3/5/15/30 min)
+//   - PCM .................. SL beyond the canal by ATR(14) x mult
+//                           (1.0/1.5/2.0/2.5/3.0x); TP = opposite canal bound;
+//                           levels are static after the signal (no trailing)
+//
+//  No repainting: rolling ta.highest/ta.lowest only; no unconfirmed pivots;
+//  strategy computes on confirmed bars (calc_on_every_tick = false) and the
+//  alert() calls fire once per bar close.
+// =============================================================================
+strategy("Fimathe Cycle + PCM", shorttitle = "Fimathe PCM", overlay = true,
+     pyramiding = 0,
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 10,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,   // fills at the signal-bar close so
+                                       // backtest fills align with the
+                                       // {{close}} price sent in alerts
+     max_bars_back = 500,
+     max_lines_count = 500,
+     max_labels_count = 500)
+
+// --- Input groups -------------------------------------------------------------
+const string GRP_TF    = "Timeframe Preset"
+const string GRP_CH    = "Channel"
+const string GRP_NZ    = "Neutral Zone"
+const string GRP_RISK  = "Risk (PCM)"
+const string GRP_ALERT = "Alerts"
+
+// =============================================================================
+// TIMEFRAME PRESET
+// Pine v6 requires every input defval to be a compile-time CONST, so a preset
+// cannot literally re-seed the default shown in another input row (compiler
+// error CE10123). Closest faithful mechanism: each parameter input defaults to
+// the sentinel -1 = "follow the preset"; typing any real value overrides ONLY
+// that parameter while the others keep tracking the preset.
+//
+// Reasoning per preset:
+//  1 min — micro cycles / pure noise scalping: short canal (40 bars ~ 40 min)
+//          hugs the micro range; TIGHTEST neutral zone (35% of width) lets the
+//          re-cross fire close to the midline for fast in-and-out trades;
+//          small ATR stop buffer (1.0x) because per-bar volatility is tiny.
+//  3 min — baseline scalping cadence: canal over 60 bars (~3 h) spans several
+//          intraday swings; mid-wide neutral zone (45%) and 1.5x ATR buffer.
+//  5 min — deeper intraday cycles: canal over 90 bars (~7.5 h) captures the
+//          full session arc; a wider neutral zone (55%) demands real
+//          displacement before a signal; 2.0x ATR buffer for wider bars.
+//  15 min — intraday swing cycles: canal over 120 bars (~30 h) spans session
+//          boundaries; neutral zone 60% + tolerance 18% skip pullback chop;
+//          2.5x ATR buffer because the per-bar range is already large.
+//  30 min — multi-session cycles: canal over 150 bars (~3 sessions on 24h
+//          markets); WIDEST zone of the family (65%) and 3.0x ATR buffer —
+//          few, slow, high-conviction cycle trades.
+//
+// NOTE (flagged, not rewritten): classic Fimathe reading often prefers a WIDER
+// neutral zone on noisier lower timeframes to filter churn; this table follows
+// the requested direction (tighter on 1 min, wider on 5 min). If 1-min signals
+// fire too early, RAISE neutralZonePct below — it is fully exposed.
+// =============================================================================
+string tfPreset = input.string("3 min", title = "Preset", options = ["1 min", "3 min", "5 min", "15 min", "30 min"],
+     group = GRP_TF,
+     tooltip = "Drives every parameter left at its -1 sentinel (see each input's tooltip). Apply the script to a chart of the same timeframe.")
+
+// Preset value tables (runtime values; NOT usable as input defvals — see the
+// CE10123 note above)
+int preChLen = switch tfPreset
+    "1 min"  => 40
+    "3 min"  => 60
+    "5 min"  => 90
+    "15 min" => 120
+    => 150
+float preNZPct = switch tfPreset
+    "1 min"  => 35.0
+    "3 min"  => 45.0
+    "5 min"  => 55.0
+    "15 min" => 60.0
+    => 65.0
+float preTolPct = switch tfPreset
+    "1 min"  => 8.0
+    "3 min"  => 12.0
+    "5 min"  => 16.0
+    "15 min" => 18.0
+    => 20.0
+float preSlMult = switch tfPreset
+    "1 min"  => 1.0
+    "3 min"  => 1.5
+    "5 min"  => 2.0
+    "15 min" => 2.5
+    => 3.0
+
+// =============================================================================
+// CHANNEL — "Canal de Referência" (Fimathe)
+// Rolling extremes as a non-repainting proxy for the reference canal.
+//
+// NOTE (flagged, not rewritten): because the window INCLUDES the current bar,
+// a touch is true whenever the bar itself sets the N-bar extreme, and the
+// canal only steps when old extremes drop out of the window (it lags one
+// swing). This is inherent to the requested rolling proxy — tune channelLen /
+// extremeTolerancePct to compensate rather than changing the logic.
+// =============================================================================
+int   channelLenIn = input.int(-1, title = "Channel length (bars)", minval = -1, maxval = 500,
+     group = GRP_CH,
+     tooltip = "-1 (default) = follow the preset; any value from 2 up overrides ONLY this parameter. Rolling window (bars) for the canal extremes: short = tight, fast canal; long = wide, slow canal.")
+float extremeTolerancePctIn = input.float(-1.0, title = "Extreme touch tolerance (% of channel width)", minval = -1.0, maxval = 50.0, step = 0.5,
+     group = GRP_CH,
+     tooltip = "-1 (default) = follow the preset; 0 = only the exact extreme counts. Teoria dos Ciclos arming: how close to the canal extreme (as % of channel width) a wick must get to count as a cycle touch.")
+
+// Resolve sentinels against the active preset (-1 -> preset value)
+int   channelLen          = channelLenIn >= 2 ? channelLenIn : preChLen
+float extremeTolerancePct = extremeTolerancePctIn >= 0.0 ? extremeTolerancePctIn : preTolPct
+
+// =============================================================================
+// NEUTRAL ZONE — "Zona Neutra" (Fimathe)
+// Decision-free band centered on the canal midline. BUY fires when close
+// crosses ABOVE the LOWER bound; SELL when close crosses BELOW the UPPER bound.
+// =============================================================================
+float neutralZonePctIn = input.float(-1.0, title = "Neutral zone width (% of channel)", minval = -1.0, maxval = 100.0, step = 1.0,
+     group = GRP_NZ,
+     tooltip = "-1 (default) = follow the preset; a real value overrides ONLY this parameter. Width of the neutral band around the midline. Smaller = signals fire closer to the midline (earlier); larger = demands more displacement.")
+float neutralZonePct = neutralZonePctIn >= 0.0 ? neutralZonePctIn : preNZPct
+
+// =============================================================================
+// RISK (PCM) — objective, non-discretionary levels
+//   Long : SL = lowerCh - ATR x mult , TP = upperCh
+//   Short: SL = upperCh + ATR x mult , TP = lowerCh
+// Levels are captured at the signal bar and held static (no trailing).
+// =============================================================================
+int   atrLen    = input.int(14, title = "ATR length", minval = 1, maxval = 100, group = GRP_RISK,
+     tooltip = "ATR lookback for the stop-distance buffer.")
+float slAtrMultIn = input.float(-1.0, title = "Stop distance (ATR multiple beyond canal)", minval = -1.0, maxval = 10.0, step = 0.1,
+     group = GRP_RISK,
+     tooltip = "-1 (default) = follow the preset; a real value overrides ONLY this parameter. PCM stop buffer added beyond the canal extreme. Take profit is always the opposite canal bound.")
+float slAtrMult = slAtrMultIn >= 0.1 ? slAtrMultIn : preSlMult
+
+bool showSLTP = input.bool(true, title = "Show SL/TP lines & labels at signal", group = GRP_RISK,
+     tooltip = "Draws the PCM stop (red) and target (green), with price labels, on every signal bar; the lines follow the open trade and freeze when it closes.")
+
+// =============================================================================
+// ALERTS
+// alertcondition()s are always available; the switch only gates the dynamic
+// alert() calls that carry the webhook JSON payload.
+// =============================================================================
+bool fireWebhookAlert = input.bool(true, title = "Fire alert() webhook JSON payload", group = GRP_ALERT,
+     tooltip = "When creating TradingView alerts from alertcondition(), choose 'Once Per Bar Close' to match the strategy's non-repainting behavior.")
+
+// =============================================================================
+// CALCULATIONS
+// =============================================================================
+
+// --- Canal de Referência (rolling, non-repainting) ----------------------------
+float upperCh = ta.highest(high, channelLen)
+float lowerCh = ta.lowest(low, channelLen)
+float midCh   = math.avg(upperCh, lowerCh)
+float chRange = upperCh - lowerCh
+
+// --- Zona Neutra (% of channel width, centered on midline) --------------------
+// neutralZonePct is a % of the FULL width -> each bound is pct/2 from midline
+float neutralUpper = midCh + chRange * neutralZonePct / 200.0
+float neutralLower = midCh - chRange * neutralZonePct / 200.0
+
+// --- ATR for the PCM stop buffer ----------------------------------------------
+float atrVal = ta.atr(atrLen)
+
+// --- Teoria dos Ciclos: extreme touches + arming flags ------------------------
+// Touch test uses the WICK (low/high), not the close. na-safe: comparisons are
+// gated behind a not-na check (v6 strict mode: no implicit bool, no raw na).
+bool touchedLower = not na(chRange) and low <= lowerCh + chRange * extremeTolerancePct / 100.0
+bool touchedUpper = not na(chRange) and high >= upperCh - chRange * extremeTolerancePct / 100.0
+
+var bool armedLong  = false   // armed by a touch of the LOWER extreme
+var bool armedShort = false   // armed by a touch of the UPPER extreme
+
+// Arm on extreme touch; disarm on the OPPOSITE touch (cycle invalidated /
+// reversal bias). If one bar somehow spans the whole canal, the upper-touch
+// branch wins (last write) — rare on scalping timeframes, acceptable.
+if touchedLower
+    armedLong := true
+    armedShort := false
+if touchedUpper
+    armedShort := true
+    armedLong := false
+
+// --- Signal triggers ----------------------------------------------------------
+// BUY : armed-from-lower-extreme AND close crosses OVER neutralLower
+// SELL: armed-from-upper-extreme AND close crosses UNDER neutralUpper
+// Fires once per cycle: the flag is disarmed immediately below, so no repeated
+// alerts while price stays beyond the level. Data must be warm (no na canal/ATR).
+// ta.crossover/ta.crossunder computed unconditionally at global scope
+// (CW10002: calls inside a conditional expression can skip bars and corrupt
+// their internal historical state)
+bool dataReady   = not na(upperCh) and not na(atrVal)
+bool crossUpNL   = ta.crossover(close, neutralLower)
+bool crossDownNU = ta.crossunder(close, neutralUpper)
+bool buySignal   = dataReady and armedLong and crossUpNL
+bool sellSignal  = dataReady and armedShort and crossDownNU
+
+// Disarm immediately after firing (exactly one signal per cycle)
+if buySignal
+    armedLong := false
+if sellSignal
+    armedShort := false
+
+// =============================================================================
+// ORDERS + PCM LEVELS (objective TP/SL, frozen at the signal bar)
+// Reversal logic: an opposite signal flips the position. With pyramiding = 0 a
+// same-direction re-signal adds nothing, but it DOES refresh the bracket with
+// the new cycle's PCM levels (new cycle -> new objective levels).
+// =============================================================================
+var float pcmLongSL  = na
+var float pcmLongTP  = na
+var float pcmShortSL = na
+var float pcmShortTP = na
+
+if buySignal
+    pcmLongSL := lowerCh - atrVal * slAtrMult   // PCM: stop beyond the lower canal
+    pcmLongTP := upperCh                         // PCM: target the opposite bound
+    strategy.entry("FMT Long", strategy.long)
+    strategy.exit("FMT Long X", from_entry = "FMT Long", stop = pcmLongSL, limit = pcmLongTP)
+
+if sellSignal
+    pcmShortSL := upperCh + atrVal * slAtrMult   // PCM: stop beyond the upper canal
+    pcmShortTP := lowerCh                        // PCM: target the opposite bound
+    strategy.entry("FMT Short", strategy.short)
+    strategy.exit("FMT Short X", from_entry = "FMT Short", stop = pcmShortSL, limit = pcmShortTP)
+
+// =============================================================================
+// PLOTS — visual audit of canal, zona neutra, PCM levels and signals
+// =============================================================================
+plotU = plot(upperCh, title = "Canal Superior", color = color.new(#26a69a, 0))
+plotL = plot(lowerCh, title = "Canal Inferior", color = color.new(#26a69a, 0))
+fill(plotU, plotL, title = "Canal de Referência", color = color.new(#26a69a, 93))
+
+plot(midCh, title = "Canal Midline", color = color.new(color.gray, 30))
+
+plotNU = plot(neutralUpper, title = "Zona Neutra — Teto", color = color.new(color.orange, 40))
+plotNL = plot(neutralLower, title = "Zona Neutra — Piso", color = color.new(color.orange, 40))
+fill(plotNU, plotNL, title = "Zona Neutra", color = color.new(color.orange, 94))
+
+// --- PCM levels at the signal: where to place the SL/TP -----------------------
+// Labels mark the exact stop/target placement on the trigger bar (history is
+// kept up to the 500-label limit); the two lines follow the open trade and
+// freeze when the position closes. A new signal replaces the previous lines.
+var line sigSLline = na
+var line sigTPline = na
+
+if buySignal and showSLTP
+    line.delete(sigSLline)
+    line.delete(sigTPline)
+    sigSLline := line.new(bar_index, pcmLongSL, bar_index + 1, pcmLongSL, color = color.new(color.red, 0), width = 2)
+    sigTPline := line.new(bar_index, pcmLongTP, bar_index + 1, pcmLongTP, color = color.new(color.green, 0), width = 2)
+    label.new(bar_index, pcmLongSL, "SL  " + str.tostring(pcmLongSL, format.mintick), style = label.style_label_left, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+    label.new(bar_index, pcmLongTP, "TP  " + str.tostring(pcmLongTP, format.mintick), style = label.style_label_left, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+
+if sellSignal and showSLTP
+    line.delete(sigSLline)
+    line.delete(sigTPline)
+    sigSLline := line.new(bar_index, pcmShortSL, bar_index + 1, pcmShortSL, color = color.new(color.red, 0), width = 2)
+    sigTPline := line.new(bar_index, pcmShortTP, bar_index + 1, pcmShortTP, color = color.new(color.green, 0), width = 2)
+    label.new(bar_index, pcmShortSL, "SL  " + str.tostring(pcmShortSL, format.mintick), style = label.style_label_left, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+    label.new(bar_index, pcmShortTP, "TP  " + str.tostring(pcmShortTP, format.mintick), style = label.style_label_left, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+
+// extend the active trade's SL/TP lines up to the current bar
+if strategy.position_size != 0 and not na(sigSLline)
+    line.set_x2(sigSLline, bar_index)
+    line.set_x2(sigTPline, bar_index)
+
+// Signal markers — exact trigger bar only (flags disarm right after firing)
+plotshape(buySignal,  title = "Fimathe PCM BUY",  style = shape.triangleup,   location = location.belowbar, color = color.new(#089981, 0), size = size.small)
+plotshape(sellSignal, title = "Fimathe PCM SELL", style = shape.triangledown, location = location.abovebar, color = color.new(#f23645, 0), size = size.small)
+
+// =============================================================================
+// ALERTS
+// Two static alertcondition()s (create two separate TradingView alerts from the
+// dropdown) + dynamic alert() calls with the webhook JSON payload. Placeholders
+// are substituted by TradingView when the alert fires.
+// =============================================================================
+alertcondition(buySignal,  title = "Fimathe PCM Buy",  message = '{"ticker":"{{ticker}}","side":"buy","price":{{close}},"tf":"{{interval}}","time":"{{timenow}}"}')
+alertcondition(sellSignal, title = "Fimathe PCM Sell", message = '{"ticker":"{{ticker}}","side":"sell","price":{{close}},"tf":"{{interval}}","time":"{{timenow}}"}')
+
+if fireWebhookAlert and buySignal
+    alert('{"ticker":"{{ticker}}","side":"buy","price":{{close}}","tf":"{{interval}}","time":"{{timenow}}"}', alert.freq_once_per_bar_close)
+if fireWebhookAlert and sellSignal
+    alert('{"ticker":"{{ticker}}","side":"sell","price":{{close}}","tf":"{{interval}}","time":"{{timenow}}"}', alert.freq_once_per_bar_close)
